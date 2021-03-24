@@ -7,22 +7,22 @@ use testi2s as _;
 // Generates Morse code audio signals for text from UART, playing back over I2S
 // Tested with nRF52840-DK and a UDA1334a DAC
 
+use embedded_hal::blocking::delay::DelayMs;
 use embedded_hal::digital::v2::{InputPin, OutputPin};
 use heapless::consts;
 use heapless::spsc::{Consumer, Producer, Queue};
-use small_morse::{encode, State};
-use {
-    hal::{
-        gpio::{Input, Level, Output, Pin, PullUp, PushPull},
-        gpiote::*,
-        i2s::*,
-        pac::{TIMER0, UARTE0},
-        timer::Timer,
-        uarte::*,
-    },
-    nrf52840_hal as hal,
-    rtic::cyccnt::U32Ext,
+use nrf52840_hal::{
+    self as hal,
+    gpio::{Input, Level, Output, Pin, PullUp, PushPull},
+    gpiote::*,
+    i2s::*,
+    pac::TIMER0,
+    timer::Timer,
 };
+
+use small_morse::{encode, State};
+
+use rtic::cyccnt::U32Ext;
 
 #[repr(align(4))]
 struct Aligned<T: ?Sized>(T);
@@ -38,11 +38,11 @@ const APP: () = {
         consumer: Consumer<'static, State, consts::U256>,
         #[init(5_000_000)]
         speed: u32,
-        uarte: Uarte<UARTE0>,
-        uarte_timer: Timer<TIMER0>,
         gpiote: Gpiote,
+        timr: Timer<TIMER0>,
         btn1: Pin<Input<PullUp>>,
         btn2: Pin<Input<PullUp>>,
+        btn3: Pin<Input<PullUp>>,
         led: Pin<Output<PushPull>>,
         transfer: Option<Transfer<&'static [i16; 32]>>,
     }
@@ -66,42 +66,32 @@ const APP: () = {
         ctx.core.DCB.enable_trace();
         ctx.core.DWT.enable_cycle_counter();
 
+        let timr: Timer<TIMER0> = Timer::new(ctx.device.TIMER0);
+
         let p0 = hal::gpio::p0::Parts::new(ctx.device.P0);
 
-        let sck_pin = p0.p0_02.into_push_pull_output(Level::Low).degrade();
-        let sdout_pin = p0.p0_01.into_push_pull_output(Level::Low).degrade();
-        let lrck_pin = p0.p0_03.into_push_pull_output(Level::Low).degrade();
+        // std out
+        let stdout = p0.p0_01.into_push_pull_output(Level::Low).degrade();
+        // sck
+        let bclk = p0.p0_02.into_push_pull_output(Level::Low).degrade();
+        // lrck
+        let lrc = p0.p0_03.into_push_pull_output(Level::Low).degrade();
 
-        let i2s = I2S::new_controller(
-            ctx.device.I2S,
-            None,
-            &sck_pin,
-            &lrck_pin,
-            None,
-            Some(&sdout_pin),
-        );
+        let i2s = I2S::new_controller(ctx.device.I2S, None, &bclk, &lrc, None, Some(&stdout));
+        i2s.set_ratio(Ratio::_256x);
+        i2s.set_mck_frequency(MckFreq::_32MDiv8);
         i2s.start();
 
         // Configure buttons
         let btn1 = p0.p0_11.into_pullup_input().degrade();
         let btn2 = p0.p0_12.into_pullup_input().degrade();
+        let btn3 = p0.p0_10.into_pullup_input().degrade();
+
         let gpiote = Gpiote::new(ctx.device.GPIOTE);
         gpiote.port().input_pin(&btn1).low();
         gpiote.port().input_pin(&btn2).low();
+        gpiote.port().input_pin(&btn3).low();
         gpiote.port().enable_interrupt();
-
-        // Configure the onboard USB CDC UARTE
-        let uarte = Uarte::new(
-            ctx.device.UARTE0,
-            Pins {
-                txd: p0.p0_06.into_push_pull_output(Level::High).degrade(),
-                rxd: p0.p0_08.into_floating_input().degrade(),
-                cts: None,
-                rts: None,
-            },
-            Parity::EXCLUDED,
-            Baudrate::BAUD115200,
-        );
 
         *ctx.resources.queue = Some(Queue::new());
         let (producer, consumer) = ctx.resources.queue.as_mut().unwrap().split();
@@ -116,49 +106,29 @@ const APP: () = {
             producer,
             consumer,
             gpiote,
+            timr,
             btn1,
             btn2,
+            btn3,
             led: p0.p0_13.into_push_pull_output(Level::High).degrade(),
-            uarte,
-            uarte_timer: Timer::new(ctx.device.TIMER0),
             transfer: i2s.tx(&MUTE_BUF.0).ok(),
             signal_buf: &SIGNAL_BUF.0,
             mute_buf: &MUTE_BUF.0,
         }
     }
 
-    #[idle(resources=[uarte, uarte_timer, producer])]
+    #[idle(resources=[producer,timr])]
     fn idle(ctx: idle::Context) -> ! {
-        let idle::Resources {
-            uarte,
-            uarte_timer,
-            producer,
-        } = ctx.resources;
-        let uarte_rx_buf = &mut [0u8; 64][..];
+        let idle::Resources { producer, timr } = ctx.resources;
+        let msg = "ilovepeanuts";
         loop {
-            match uarte.read_timeout(uarte_rx_buf, uarte_timer, 100_000) {
-                Ok(_) => {
-                    if let Ok(msg) = core::str::from_utf8(&uarte_rx_buf[..]) {
-                        defmt::info!("{}", msg);
-                        for action in encode(msg) {
-                            for _ in 0..action.duration {
-                                producer.enqueue(action.state).ok();
-                            }
-                        }
-                    }
+            defmt::info!("enqueuing msg");
+            for action in encode(msg) {
+                for _ in 0..action.duration {
+                    producer.enqueue(action.state).ok();
                 }
-                Err(hal::uarte::Error::Timeout(n)) if n > 0 => {
-                    if let Ok(msg) = core::str::from_utf8(&uarte_rx_buf[..n]) {
-                        defmt::info!("{}", msg);
-                        for action in encode(msg) {
-                            for _ in 0..action.duration {
-                                producer.enqueue(action.state).ok();
-                            }
-                        }
-                    }
-                }
-                _ => {}
             }
+            timr.delay_ms(1000u32);
         }
     }
 
@@ -167,6 +137,7 @@ const APP: () = {
         let (_buf, i2s) = ctx.resources.transfer.take().unwrap().wait();
         match ctx.resources.consumer.dequeue() {
             Some(State::On) => {
+                defmt::info!("transmitting msg");
                 // Move TX pointer to signal buffer (sound ON)
                 *ctx.resources.transfer = i2s.tx(*ctx.resources.signal_buf).ok();
                 ctx.resources.led.set_low().ok();
